@@ -23,8 +23,29 @@ function blank() {
     budget: { takeHome: 0, note: '', buckets: [] },
     forecast: { includeCpf: false, monthlyInvest: 500, monthlySave: 500, investReturn: 7, saveRate: 0.5,
       cpfMonthly: 0, cpfRate: 3.5, target: 1000000, retireAge: 60, spend: 4000, inflation: 2.5, realTerms: false },
+    cpf: { ...CPF_DEFAULTS },
     notes: '', prefs: {},
   };
+}
+
+// CPF rules for members under 55 (cpf.gov.sg, Q4 2026). Caps change yearly — editable on the Growth page.
+const CPF_DEFAULTS = {
+  salary: 0, startMonth: '', owCeiling: 8000, bhs: 79000, frs: 220400,
+  oaRate: 2.5, saRate: 4, maRate: 4, extraRate: 1, extraCap: 60000, extraOaCap: 20000,
+};
+// CIMB FastSaver base tiers (Oct 2026), excluding fresh-funds promotions.
+const CIMB_TIERS = '25000 @ 0.5\n25000 @ 1.08\n25000 @ 1.58\nrest @ 0.5';
+
+// One-time defaults for data saved before per-account rates existed.
+function migrate(d) {
+  if (d.prefs.ratesV2) return;
+  for (const a of d.accounts) {
+    if (a.rate != null || a.tiers) continue;
+    const n = `${a.institution || ''} ${a.name}`.toLowerCase();
+    if (/posb/.test(n)) a.rate = 0.05;
+    else if (/cimb/.test(n)) a.tiers = CIMB_TIERS;
+  }
+  d.prefs.ratesV2 = true;
 }
 
 function save() {
@@ -83,6 +104,92 @@ function totals() {
   const capital = sum(invested, capSgd), invValue = sum(invested, valSgd);
   return { ...g, assets, liab, nw: assets - liab, liquid: g.cash + g.investments, capital, invValue };
 }
+/* ---------- interest & growth engine ---------- */
+
+function parseTiers(text) {
+  return String(text || '').split('\n').map(l => l.match(/^\s*(rest|[\d,.]+)\s*@\s*([\d.]+)/i)).filter(Boolean)
+    .map(m => ({ size: /rest/i.test(m[1]) ? Infinity : parseFloat(m[1].replace(/,/g, '')), rate: parseFloat(m[2]) }));
+}
+// Annual interest on a cash balance, honouring tiered bands if set.
+function annualInterest(a, bal) {
+  const tiers = parseTiers(a.tiers);
+  if (!tiers.length) return bal * (+a.rate || 0) / 100;
+  let left = bal, out = 0;
+  for (const t of tiers) { const part = Math.min(left, t.size); out += part * t.rate / 100; left -= part; if (left <= 0) break; }
+  return out;
+}
+function cpfKind(a) {
+  if (a.group !== 'cpf') return null;
+  if (a.cpfKind) return a.cpfKind;
+  const n = ` ${a.name} `.toLowerCase();
+  if (/ordinary|\boa\b/.test(n)) return 'oa';
+  if (/medi|\bma\b/.test(n)) return 'ma';
+  return 'sa';
+}
+function rateLabel(a) {
+  if (a.group === 'cpf') { const k = cpfKind(a); return `${S.cpf[k + 'Rate']}% + extra`; }
+  if (a.group === 'investments') return `${a.rate ?? S.forecast.investReturn}% exp.`;
+  const v = valSgd(a);
+  if (parseTiers(a.tiers).length) return `Tiered · ${(v ? annualInterest(a, v) / v * 100 : parseTiers(a.tiers)[0].rate).toFixed(2)}%`;
+  return +a.rate ? `${a.rate}% p.a.` : '';
+}
+// CPF allocation of total contributions by age (OA, SA, MA), 2026 tables.
+const cpfShare = age => age <= 35 ? [.6217, .1621, .2162] : age <= 45 ? [.5677, .1891, .2432] : age <= 50 ? [.5136, .2162, .2702] : [.4055, .3108, .2837];
+
+// Month-by-month projection of the selected account groups.
+// Cash: monthly interest (tiered); investments: expected return; CPF: monthly accrual
+// credited each January, extra interest, salary contributions, MA→SA→OA overflow.
+function simulate(months, { groups = ['cash', 'cpf'], stopAge = 999 } = {}) {
+  const c = S.cpf, a0 = ageNow(), start = new Date(); start.setDate(1);
+  const accts = S.accounts.filter(a => groups.includes(a.group in GROUPS ? a.group : 'other'));
+  const bal = {}, dep = {}, int = {}, pend = {};
+  accts.forEach(a => { bal[a.id] = valSgd(a); dep[a.id] = 0; int[a.id] = 0; pend[a.id] = 0; });
+  const cid = {};
+  accts.forEach(a => { const k = cpfKind(a); if (k && !cid[k]) cid[k] = a.id; });
+  const any = cid.oa || cid.sa || cid.ma;
+  const into = (k, amt, kind = 'dep') => { const id = cid[k] || cid.sa || cid.oa || cid.ma; if (!id) return; bal[id] += amt; (kind === 'dep' ? dep : int)[id] += amt; };
+  const work = c.startMonth ? parseDate(c.startMonth + '-01') : null;
+  const total = () => accts.reduce((s, a) => s + bal[a.id] + pend[a.id], 0);
+  const series = [{ x: +start, y: total() }];
+  for (let m = 1; m <= months; m++) {
+    const d = new Date(start); d.setMonth(start.getMonth() + m);
+    const age = a0 + m / 12;
+    for (const a of accts) {
+      if (a.group === 'cpf') continue;
+      const i = a.group === 'investments' ? bal[a.id] * (+(a.rate ?? S.forecast.investReturn) || 0) / 1200 : annualInterest(a, bal[a.id]) / 12;
+      bal[a.id] += i; int[a.id] += i;
+      const p = +a.monthly || 0; bal[a.id] += p; dep[a.id] += p;
+    }
+    if (any) {
+      const g = k => cid[k] ? bal[cid[k]] : 0;
+      const oa = g('oa'), sa = g('sa'), ma = g('ma');
+      if (cid.oa) pend[cid.oa] += oa * c.oaRate / 1200;
+      if (cid.sa) pend[cid.sa] += sa * c.saRate / 1200;
+      if (cid.ma) pend[cid.ma] += ma * c.maRate / 1200;
+      let room = c.extraCap;
+      const eOa = Math.min(oa, c.extraOaCap, room); room -= eOa;
+      const eSa = Math.min(sa, room); room -= eSa;
+      const eMa = Math.min(ma, room);
+      const x = c.extraRate / 1200;
+      pend[cid.sa || cid.oa] += eOa * x;   // OA's extra interest goes to SA
+      if (cid.sa) pend[cid.sa] += eSa * x;
+      if (cid.ma) pend[cid.ma] += eMa * x;
+      if (d.getMonth() === 0 || m === months) {   // credited at the start of each year
+        for (const k of ['oa', 'sa', 'ma']) if (cid[k]) { into(k, pend[cid[k]], 'int'); pend[cid[k]] = 0; }
+      }
+      if (+c.salary > 0 && work && d >= work && age < stopAge) {
+        const amt = 0.37 * Math.min(+c.salary, +c.owCeiling || Infinity);
+        const [so, ss, sm] = cpfShare(age);
+        into('oa', amt * so); into('sa', amt * ss); into('ma', amt * sm);
+      }
+      if (cid.ma && bal[cid.ma] > c.bhs) { const over = bal[cid.ma] - c.bhs; bal[cid.ma] -= over; dep[cid.ma] -= over; into(g('sa') < c.frs ? 'sa' : 'oa', over); }
+      if (cid.sa && cid.oa && bal[cid.sa] > c.frs) { const over = bal[cid.sa] - c.frs; bal[cid.sa] -= over; dep[cid.sa] -= over; into('oa', over); }
+    }
+    series.push({ x: +d, y: total(), m });
+  }
+  return { series, accts, bal, dep, int };
+}
+
 const snapNw = s => (+s.cash || 0) + (+s.investments || 0) + (+s.cpf || 0) + (+s.other || 0) - (+s.liabilities || 0);
 const snapsAsc = () => [...S.snapshots].sort((a, b) => a.date.localeCompare(b.date));
 
@@ -137,38 +244,86 @@ function lineChart(id, pts, o = {}) {
     return `<text class="axis-text" x="${q.px ?? X(p.x)}" y="${H - 4}" text-anchor="${anchor}">${xl(p)}</text>`;
   }).join('');
   const last = P[P.length - 1];
-  CH[id] = { pts: P, W, tip: o.tip };
+  CH[id] = { pts: P, W, tip: o.tip, at: o.at || (() => '') };
   return `<div class="chart" data-ch="${id}"><div class="tip"></div>
     <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(o.label || 'Chart')}">
       ${grid}${ref}
       <path d="${area}" fill="var(--chart-fill)"/>
       <path d="${d}" fill="none" stroke="var(--chart-line)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
       <circle cx="${last.px}" cy="${last.py}" r="4.5" fill="var(--chart-line)" stroke="var(--card)" stroke-width="2"/>
-      <line class="hl" x1="0" x2="0" y1="${pt}" y2="${H - pb}"/>
+      <rect class="sel" x="0" y="${pt}" width="0" height="${H - pt - pb}"/>
+      <path class="seg" d="" fill="none" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+      <line class="hl" x1="0" x2="0" y1="${pt}" y2="${H - pb}"/><line class="hl hl2" x1="0" x2="0" y1="${pt}" y2="${H - pb}"/>
       <circle class="hd" r="4.5" cx="-20" cy="-20" fill="var(--chart-line)" stroke="var(--card)" stroke-width="2"/>
+      <circle class="hd hd2" r="4.5" cx="-20" cy="-20" fill="var(--chart-line)" stroke="var(--card)" stroke-width="2"/>
       ${ticks}
     </svg></div>`;
 }
+// One finger / hover: value at a point. Two fingers (or mouse drag): change between two points.
 function bindCharts() {
   document.querySelectorAll('.chart[data-ch]').forEach(el => {
     const c = CH[el.dataset.ch]; if (!c) return;
-    const svg = $('svg', el), tip = $('.tip', el), hl = $('.hl', svg), hd = $('.hd', svg);
-    const move = e => {
-      const r = svg.getBoundingClientRect();
-      const vx = (e.clientX - r.left) / r.width * c.W;
-      let best = c.pts[0];
-      for (const p of c.pts) if (Math.abs(p.px - vx) < Math.abs(best.px - vx)) best = p;
-      hl.setAttribute('x1', best.px); hl.setAttribute('x2', best.px);
-      hd.setAttribute('cx', best.px); hd.setAttribute('cy', best.py);
-      tip.innerHTML = c.tip(best);
-      tip.style.left = clamp(best.px / c.W * r.width, 60, r.width - 60) + 'px';
-      el.classList.add('active');
+    const svg = $('svg', el), tip = $('.tip', el);
+    const [hl, hl2] = svg.querySelectorAll('.hl'), [hd, hd2] = svg.querySelectorAll('.hd');
+    const sel = $('.sel', svg), seg = $('.seg', svg);
+    const idx = clientX => {
+      const r = svg.getBoundingClientRect(), vx = (clientX - r.left) / r.width * c.W;
+      let bi = 0;
+      c.pts.forEach((p, i) => { if (Math.abs(p.px - vx) < Math.abs(c.pts[bi].px - vx)) bi = i; });
+      return bi;
     };
-    el.addEventListener('pointermove', move);
-    el.addEventListener('pointerdown', move);
-    el.addEventListener('pointerleave', () => el.classList.remove('active'));
+    const mark = (line, dot, p) => {
+      line.setAttribute('x1', p.px); line.setAttribute('x2', p.px);
+      dot.setAttribute('cx', p.px); dot.setAttribute('cy', p.py);
+    };
+    const place = px => { const w = svg.getBoundingClientRect().width; tip.style.left = clamp(px / c.W * w, 80, w - 80) + 'px'; };
+    const point = i => {
+      const p = c.pts[i];
+      el.classList.remove('ranging', 'up', 'down'); el.classList.add('active');
+      tip.className = 'tip'; mark(hl, hd, p); tip.innerHTML = c.tip(p); place(p.px);
+    };
+    const range = (i, j) => {
+      if (i > j) [i, j] = [j, i];
+      if (i === j) return point(i);
+      const p = c.pts[i], q = c.pts[j], diff = q.y - p.y, up = diff >= 0;
+      const rel = p.y ? diff / Math.abs(p.y) : null;
+      el.classList.add('active', 'ranging'); el.classList.toggle('up', up); el.classList.toggle('down', !up);
+      mark(hl, hd, p); mark(hl2, hd2, q);
+      sel.setAttribute('x', p.px); sel.setAttribute('width', q.px - p.px);
+      seg.setAttribute('d', c.pts.slice(i, j + 1).map((z, k) => `${k ? 'L' : 'M'}${z.px},${z.py}`).join(''));
+      tip.className = `tip range ${up ? 'up' : 'down'}`;
+      tip.innerHTML = `${up ? '▲' : '▼'} <span class="amt">${up ? '+' : '−'}${moneyText(Math.abs(diff))}</span>${rel !== null ? ` · ${pct(rel)}` : ''}
+        <div class="sub">${esc(c.at(p))} → ${esc(c.at(q))}</div>`;
+      place((p.px + q.px) / 2);
+    };
+    let pinned = false;
+    const clear = () => { pinned = false; el.classList.remove('active', 'ranging', 'up', 'down'); };
+    el._clear = clear;
+
+    // touch: preventDefault on two fingers so the page doesn't pinch-zoom
+    const onTouch = e => {
+      const t = e.touches;
+      if (t.length >= 2) { e.preventDefault(); pinned = true; range(idx(t[0].clientX), idx(t[1].clientX)); }
+      else if (t.length === 1 && !pinned) point(idx(t[0].clientX));
+    };
+    el.addEventListener('touchstart', e => { if (e.touches.length === 1) pinned = false; onTouch(e); }, { passive: false });
+    el.addEventListener('touchmove', onTouch, { passive: false });
+    el.addEventListener('touchend', e => { if (!e.touches.length && !pinned) setTimeout(clear, 1500); });
+    el.addEventListener('gesturestart', e => e.preventDefault());
+
+    // mouse: hover shows a point, drag selects a range
+    let from = null;
+    el.addEventListener('mousedown', e => { from = idx(e.clientX); point(from); e.preventDefault(); });
+    el.addEventListener('mousemove', e => { if (from !== null) range(from, idx(e.clientX)); else if (!pinned) point(idx(e.clientX)); });
+    const endDrag = () => { if (from !== null) { pinned = el.classList.contains('ranging'); from = null; } };
+    el.addEventListener('mouseup', endDrag);
+    el.addEventListener('mouseleave', () => { endDrag(); if (!pinned) clear(); });
   });
 }
+// A tap outside a chart dismisses any pinned range.
+document.addEventListener('pointerdown', e => {
+  document.querySelectorAll('.chart.active').forEach(el => { if (!el.contains(e.target)) el._clear?.(); });
+}, true);
 function stackBar(parts) {
   const total = sum(parts, p => Math.max(0, p.v)) || 1;
   return `<div class="stack">${parts.filter(p => p.v > 0).map(p =>
@@ -226,9 +381,10 @@ function pageHome() {
       ${lineChart('nw', pts, {
         label: 'Net worth over time',
         xl: p => p.now ? 'Now' : fmtDate(p.date, true),
+        at: p => p.now ? 'Now' : fmtDate(p.date, true),
         tip: p => `<span class="amt">${moneyText(p.y)}</span> <span class="muted">${p.now ? 'Now' : fmtDate(p.date)}</span>`,
       })}
-      ${first ? `<div class="small muted" style="margin-top:10px">Since ${fmtDate(first.date, true)}: ${signed(t.nw - snapNw(first))}</div>` : ''}
+      ${first ? `<div class="small muted" style="margin-top:10px">Since ${fmtDate(first.date, true)}: ${signed(t.nw - snapNw(first))} · two fingers to compare</div>` : ''}
     </div>
 
     <div class="card">
@@ -261,7 +417,7 @@ function pageHome() {
 
 function acctRow(a) {
   const roi = a.group === 'investments' && +a.capital > 0 ? +a.value / +a.capital - 1 : null;
-  const meta = [a.institution, a.currency === 'USD' ? `US$${nf2.format(+a.value || 0)}` : '', roi !== null ? `<span class="${roi >= 0 ? 'pos' : 'neg'}">${pct(roi)}</span>` : '']
+  const meta = [a.institution, a.group !== 'investments' ? rateLabel(a) : '', a.currency === 'USD' ? `US$${nf2.format(+a.value || 0)}` : '', roi !== null ? `<span class="${roi >= 0 ? 'pos' : 'neg'}">${pct(roi)}</span>` : '']
     .filter(Boolean).join(' · ');
   return `<button class="row" data-act="editAccount" data-id="${a.id}">
     <div class="main"><div class="title">${esc(a.name)}</div><div class="meta">${meta || '&nbsp;'}</div></div>
@@ -357,18 +513,27 @@ function pageGoals() {
 }
 
 /* forecast */
+let cpfPathCache = null;
+// CPF balance by month to 85 using the real CPF rules (no withdrawals modelled).
+function cpfPath(f) {
+  const key = JSON.stringify([S.cpf, f.retireAge, S.accounts.filter(a => a.group === 'cpf'), S.profile.birthYear]);
+  if (cpfPathCache?.key !== key) cpfPathCache = { key, ys: simulate((85 - ageNow()) * 12, { groups: ['cpf'], stopAge: f.retireAge }).series.map(p => p.y) };
+  return cpfPathCache.ys;
+}
+
 function project(f, override = {}) {
   f = { ...f, ...override };
   const t = totals(), a0 = ageNow(), endAge = 85;
-  let inv = t.investments, sav = t.cash, cpf = f.includeCpf ? t.cpf : 0;
-  const r = (+f.investReturn || 0) / 1200, s = (+f.saveRate || 0) / 1200, c = (+f.cpfRate || 0) / 1200, i = (+f.inflation || 0) / 100;
+  const cp = f.includeCpf ? cpfPath(f) : null;
+  let inv = t.investments, sav = t.cash, cpf = cp ? cp[0] : 0;
+  const r = (+f.investReturn || 0) / 1200, s = (+f.saveRate || 0) / 1200, i = (+f.inflation || 0) / 100;
   const rows = [{ age: a0, inv, sav, cpf, total: inv + sav + cpf }];
   let runOut = null;
   for (let m = 1; m <= (endAge - a0) * 12; m++) {
     const age = a0 + m / 12, working = age <= f.retireAge;
     inv = inv * (1 + r) + (working ? +f.monthlyInvest || 0 : 0);
     sav = sav * (1 + s) + (working ? +f.monthlySave || 0 : 0);
-    cpf = cpf * (1 + c) + (working && f.includeCpf ? +f.cpfMonthly || 0 : 0);
+    cpf = cp ? cp[m] ?? cpf : 0;
     if (!working) {
       let w = (+f.spend || 0) * Math.pow(1 + i, age - a0);
       const fromSav = Math.min(sav, w); sav -= fromSav; w -= fromSav;
@@ -390,7 +555,61 @@ function requiredInvest(f) {
   return Math.ceil(hi / 10) * 10;
 }
 
-function pageForecast() {
+const fcSwitch = () => `<div style="margin:-6px 0 14px"><span class="seg">${[['retire', 'Retirement'], ['growth', 'Account growth']].map(([k, l]) =>
+  `<button class="${(S.prefs.fcView || 'retire') === k ? 'on' : ''}" data-act="fcView" data-id="${k}">${l}</button>`).join('')}</span></div>`;
+
+function pageForecast() { return S.prefs.fcView === 'growth' ? pageGrowth() : pageRetire(); }
+
+function pageGrowth() {
+  const g = S.prefs.growth || (S.prefs.growth = { years: 10, groups: ['cash', 'cpf'] });
+  const sim = simulate(g.years * 12, { groups: g.groups });
+  const y0 = new Date().getFullYear(), a0 = ageNow();
+  const start = sim.series[0].y, end = sim.series[sim.series.length - 1].y;
+  const interest = sum(sim.accts, a => sim.int[a.id]), deposits = sum(sim.accts, a => sim.dep[a.id]);
+  const c = S.cpf;
+  const step = g.years <= 1 ? 1 : g.years <= 5 ? 3 : 6;
+  const pts = sim.series.filter((p, i, arr) => i % step === 0 || i === arr.length - 1).map(p => ({ ...p }));
+  const cfield = (k, label, unit, type = 'number') => `<div class="field"><label for="c-${k}">${label}</label>
+    <input id="c-${k}" type="${type}" ${type === 'number' ? 'inputmode="decimal" step="any"' : ''} data-cpf="${k}" value="${esc(c[k])}"><span class="unit">${unit}</span></div>`;
+  const chip = (k, l) => `<button class="${g.groups.includes(k) ? 'on' : ''}" data-act="growthGroup" data-id="${k}">${l}</button>`;
+
+  return header('Forecast', 'Growth of your accounts at their own rates', hideBtn()) + fcSwitch() + `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <span class="seg">${chip('cash', 'Cash')}${chip('cpf', 'CPF')}${chip('investments', 'Invest')}</span>
+        <span class="seg">${[1, 5, 10, 20].map(y => `<button class="${g.years === y ? 'on' : ''}" data-act="growthYears" data-id="${y}">${y}Y</button>`).join('')}</span>
+      </div>
+      <div class="answer">In ${g.years} year${g.years > 1 ? 's' : ''} <span class="muted" style="font-weight:500">(${y0 + g.years})</span>: <em>${money(end)}</em></div>
+      <div class="small muted">From ${money(start)} today · ${signed(interest)} interest${deposits ? ` · ${signed(deposits)} contributions` : ''}</div>
+      <div style="margin-top:10px">${lineChart('gr', pts, {
+        label: 'Projected account balances',
+        xl: p => p.m ? fmtDate(new Date(p.x).toLocaleDateString('en-CA'), true) : 'Now',
+        at: p => p.m ? fmtDate(new Date(p.x).toLocaleDateString('en-CA'), true) : 'Now',
+        tip: p => `<span class="amt">${moneyText(p.y)}</span> <span class="muted">${p.m ? fmtDate(new Date(p.x).toLocaleDateString('en-CA'), true) : 'Now'}</span>`,
+      })}</div>
+      <div class="small muted" style="margin-top:8px">Touch with two fingers to compare any two points.</div>
+    </div>
+
+    <div class="card flush">${sim.accts.map(a => {
+      const now = valSgd(a), later = sim.bal[a.id];
+      return `<button class="row" data-act="editAccount" data-id="${a.id}"><div class="main"><div class="title">${esc(a.institution ? a.institution + ' ' : '')}${esc(a.name)}</div>
+        <div class="meta">${money(now)} now · ${esc(rateLabel(a) || 'no rate set')}</div></div>
+        <div class="val">${money(later)}<div class="meta"><span class="pos">+<span class="amt">${moneyText(sim.int[a.id])}</span></span>${sim.dep[a.id] > 0.5 ? ` · +<span class="amt">${moneyText(sim.dep[a.id])}</span> in` : ''}</div></div>${ICON.chev}</button>`;
+    }).join('') || '<div class="empty">Pick at least one group above</div>'}</div>
+
+    <div class="card"><h3>CPF assumptions</h3>
+      ${cfield('salary', 'Monthly salary (0 = not working)', 'S$')}
+      ${cfield('startMonth', 'Contributions start', '', 'month')}
+      <details><summary class="small muted" style="padding:10px 0;cursor:pointer">Rates & limits (check cpf.gov.sg each year)</summary>
+        ${cfield('oaRate', 'OA interest', '%')}${cfield('saRate', 'SA interest', '%')}${cfield('maRate', 'MA interest', '%')}
+        ${cfield('extraRate', 'Extra interest', '%')}${cfield('extraCap', 'Extra on first', 'S$')}${cfield('extraOaCap', '…of which OA up to', 'S$')}
+        ${cfield('owCeiling', 'Wage ceiling', 'S$')}${cfield('bhs', 'Basic Healthcare Sum', 'S$')}${cfield('frs', 'Full Retirement Sum', 'S$')}
+      </details>
+      <div class="small muted" style="padding-top:8px">37% of salary (up to the ceiling) is split into OA/SA/MA by age. CPF interest accrues monthly and is credited each January; extra interest on OA goes to SA. MA above the Basic Healthcare Sum overflows to SA. Rules after 55 are simplified.</div>
+    </div>`;
+}
+
+function pageRetire() {
   const f = S.forecast, a0 = ageNow(), y0 = new Date().getFullYear();
   const { rows, runOut } = project(f);
   const atRetire = rows.find(r => r.age >= f.retireAge);
@@ -404,7 +623,7 @@ function pageForecast() {
     <input id="f-${k}" type="number" inputmode="decimal" step="${step}" data-f="${k}" value="${esc(f[k])}"><span class="unit">${unit}</span></div>`;
   const chk = (k, label) => `<div class="field"><label for="f-${k}">${label}</label><input id="f-${k}" type="checkbox" data-f="${k}" ${f[k] ? 'checked' : ''}></div>`;
 
-  return header('Forecast', f.realTerms ? "In today's dollars" : 'Future dollars, before inflation', hideBtn()) + `
+  return header('Forecast', f.realTerms ? "In today's dollars" : 'Future dollars, before inflation', hideBtn()) + fcSwitch() + `
     <div class="card">
       <div class="answer">${hit
         ? `You reach <em>${money(f.target)}</em> at age <em>${hit.age}</em> <span class="muted" style="font-weight:500">(${y0 + hit.age - a0})</span>`
@@ -412,7 +631,7 @@ function pageForecast() {
       <div class="small muted">At ${f.retireAge}: ${money(atRetire?.shown ?? 0)} · ${runOut ? `money runs out at ${runOut} spending ${money(f.spend)}/mth` : `lasts past 85 spending ${money(f.spend)}/mth`}</div>
       <div style="margin-top:14px">${lineChart('fc', pts, {
         h: 180, ref: +f.target, refLabel: `Target ${compact(+f.target)}`, xticks: ticks,
-        label: 'Projected wealth by age', xl: p => `Age ${p.age}`,
+        label: 'Projected wealth by age', xl: p => `Age ${p.age}`, at: p => `age ${p.age}`,
         tip: p => `<span class="amt">${moneyText(p.y)}</span> <span class="muted">age ${p.age} · ${y0 + p.age - a0}</span>`,
       })}</div>
     </div>
@@ -436,7 +655,7 @@ function pageForecast() {
       ${num('inflation', 'Inflation', '%/yr', .1)}
       ${chk('realTerms', "Show in today's dollars")}
       ${chk('includeCpf', 'Include CPF')}
-      ${f.includeCpf ? num('cpfMonthly', 'CPF contribution / mth', 'S$', 10) + num('cpfRate', 'CPF blended interest', '%/yr', .1) : ''}
+      ${f.includeCpf ? `<div class="small muted" style="padding:4px 0 8px">CPF uses its real rates and your salary from <button class="link small" data-act="fcView" data-id="growth">CPF assumptions</button>.</div>` : ''}
       <div class="small muted" style="padding-top:10px">Starts from today's ${money(t.cash)} cash and ${money(t.investments)} investments${f.includeCpf ? ` and ${money(t.cpf)} CPF` : ''}. Contributions stop at retirement; then spending (rising with inflation) is drawn from savings first, then investments.</div>
     </div>
 
@@ -614,6 +833,10 @@ const ACCT_FIELDS = () => [
   { k: 'currency', label: 'Currency', type: 'select', options: [['SGD', 'SGD'], ['USD', 'USD']] },
   { k: 'value', label: 'Current value', type: 'number' },
   { k: 'capital', label: 'Capital invested (for investments)', type: 'number' },
+  { k: 'rate', label: 'Interest / expected return (% p.a.)', type: 'number', ph: 'Investments: blank uses Forecast return' },
+  { k: 'tiers', label: 'Tiered rates (optional) — one band per line', type: 'textarea', ph: '25000 @ 0.5\n25000 @ 1.08\nrest @ 0.5' },
+  { k: 'monthly', label: 'Monthly deposit (for projections)', type: 'number' },
+  { k: 'cpfKind', label: 'CPF account type (CPF only)', type: 'select', options: [['', 'Auto from name'], ['oa', 'Ordinary (OA)'], ['sa', 'Special (SA)'], ['ma', 'MediSave (MA)']] },
   { k: 'note', label: 'Note', type: 'textarea' },
 ];
 function editAccount(id, group) {
@@ -759,8 +982,10 @@ function importData() {
 }
 function normalise(d) {
   const b = blank();
-  return { ...b, ...d, profile: { ...b.profile, ...d.profile }, forecast: { ...b.forecast, ...d.forecast },
-    budget: { ...b.budget, ...d.budget }, prefs: { ...b.prefs, ...d.prefs } };
+  const out = { ...b, ...d, profile: { ...b.profile, ...d.profile }, forecast: { ...b.forecast, ...d.forecast },
+    budget: { ...b.budget, ...d.budget }, cpf: { ...b.cpf, ...d.cpf }, prefs: { ...b.prefs, ...d.prefs } };
+  migrate(out);
+  return out;
 }
 
 /* ---------- events ---------- */
@@ -782,6 +1007,13 @@ const ACT = {
   range: id => { ui.range = id; render(true); },
   toggleHide: () => { S.prefs.hide = !S.prefs.hide; save(); render(true); },
   theme: id => { S.prefs.theme = id; save(); applyTheme(); render(true); },
+  fcView: id => { S.prefs.fcView = id; save(); render(); },
+  growthYears: id => { S.prefs.growth.years = +id; save(); render(true); },
+  growthGroup: id => {
+    const gs = S.prefs.growth.groups;
+    S.prefs.growth.groups = gs.includes(id) ? gs.filter(x => x !== id) : [...gs, id];
+    save(); render(true);
+  },
   addAccount: g => editAccount(null, g), editAccount: id => editAccount(id),
   addDebt: () => editDebt(null), editDebt: id => editDebt(id),
   addGoal: () => editGoal(null), editGoal: id => editGoal(id),
@@ -812,6 +1044,9 @@ document.addEventListener('change', e => {
   } else if (el.dataset.p) {
     S.profile[el.dataset.p] = el.type === 'number' ? parseFloat(el.value) || 0 : el.value.trim();
     save();
+  } else if (el.dataset.cpf) {
+    S.cpf[el.dataset.cpf] = el.type === 'number' ? parseFloat(el.value) || 0 : el.value;
+    save(); render(true);
   } else if (el.dataset.b) {
     S.budget[el.dataset.b] = parseFloat(el.value) || 0; save(); render(true);
   }

@@ -136,11 +136,24 @@ body.hide .amt { filter: blur(7px); user-select: none; }
 .seg button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
 
 /* chart */
-.chart { position: relative; touch-action: pan-y; padding-top: 28px; }
+.chart { position: relative; touch-action: pan-y; padding-top: 42px; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
 .chart .hl { stroke: var(--text-3); stroke-width: 1; opacity: 0; }
 .chart .hd { opacity: 0; }
-.chart.active .hl, .chart.active .hd { opacity: 1; }
+.chart.active .hl:not(.hl2), .chart.active .hd:not(.hd2) { opacity: 1; }
+.chart.ranging .hl2, .chart.ranging .hd2 { opacity: 1; }
+.chart .sel, .chart .seg { opacity: 0; }
+.chart.ranging .sel, .chart.ranging .seg { opacity: 1; }
+.chart.up .sel { fill: var(--pos); fill-opacity: .12; }
+.chart.down .sel { fill: var(--neg); fill-opacity: .12; }
+.chart.up .seg { stroke: var(--pos); }
+.chart.down .seg { stroke: var(--neg); }
+.chart.up .hd { fill: var(--pos); }
+.chart.down .hd { fill: var(--neg); }
+.chart .tip.range { padding: 6px 10px; text-align: center; color: #fff; }
+.chart .tip.up { background: #0b7a0b; }
+.chart .tip.down { background: #c23434; }
+.chart .tip .sub { font-weight: 500; font-size: 11px; opacity: .85; }
 .chart .tip { position: absolute; top: 0; transform: translateX(-50%); background: var(--text); color: var(--bg); font-size: 12px; font-weight: 600; padding: 4px 8px; border-radius: 8px; pointer-events: none; white-space: nowrap; opacity: 0; transition: opacity .12s; }
 .chart .tip .muted { color: inherit; opacity: .7; font-weight: 500; }
 .chart.active .tip { opacity: 1; }
